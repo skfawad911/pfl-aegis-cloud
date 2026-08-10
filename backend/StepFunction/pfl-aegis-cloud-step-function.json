@@ -1,0 +1,539 @@
+{
+  "Comment": "AI Agent Orchestrator with Correlation Support",
+  "StartAt": "ClassifyAndRoute",
+  "States": {
+    "ClassifyAndRoute": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.agent",
+          "StringEquals": "finops",
+          "Next": "CallFinOpsAgent"
+        },
+        {
+          "Variable": "$.agent",
+          "StringEquals": "security",
+          "Next": "CallSecurityAgent"
+        },
+        {
+          "Variable": "$.agent",
+          "StringEquals": "compliance",
+          "Next": "CallComplianceAgent"
+        },
+        {
+          "Variable": "$.agent",
+          "StringEquals": "all",
+          "Next": "CallAllAgentsParallel"
+        }
+      ],
+      "Default": "CallFinOpsAgent"
+    },
+    "CallFinOpsAgent": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:ap-south-1:644130540803:function:pfl-aegis-cloud-FinOpsAgent-prod-aps1",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "agent_response.$": "$.Payload",
+        "job_id.$": "$$.Execution.Input.job_id",
+        "agent.$": "$$.Execution.Input.agent",
+        "query.$": "$$.Execution.Input.query",
+        "user_id.$": "$$.Execution.Input.user_id"
+      },
+      "ResultPath": "$",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "SaveErrorToDynamoDB",
+          "ResultPath": "$.error_info"
+        }
+      ],
+      "Next": "CheckFinOpsCorrelation"
+    },
+    "CheckFinOpsCorrelation": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.agent_response.is_anomaly",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.agent_response.correlation_hint",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.agent_response.correlation_hint",
+              "StringGreaterThan": ""
+            }
+          ],
+          "Next": "RunCorrelationAgentsParallel"
+        }
+      ],
+      "Default": "SaveResultToDynamoDB"
+    },
+    "RunCorrelationAgentsParallel": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "SecurityCorrelation",
+          "States": {
+            "SecurityCorrelation": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "arn:aws:lambda:ap-south-1:644130540803:function:pfl-aegis-cloud-SecurityAgent-prod-aps1",
+                "Payload": {
+                  "agent": "security",
+                  "query.$": "$$.Execution.Input.query",
+                  "user_id.$": "$$.Execution.Input.user_id",
+                  "job_id.$": "$$.Execution.Input.job_id",
+                  "triggered_by": "finops_correlation"
+                }
+              },
+              "OutputPath": "$.Payload",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "SecurityCorrelationFailed",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "End": true
+            },
+            "SecurityCorrelationFailed": {
+              "Type": "Pass",
+              "Parameters": {
+                "agent": "security",
+                "status": "error",
+                "message": "Security correlation failed"
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "ComplianceCorrelation",
+          "States": {
+            "ComplianceCorrelation": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "arn:aws:lambda:ap-south-1:644130540803:function:pfl-aegis-cloud-ComplianceAgent-prod-aps1",
+                "Payload": {
+                  "agent": "compliance",
+                  "query.$": "$$.Execution.Input.query",
+                  "user_id.$": "$$.Execution.Input.user_id",
+                  "job_id.$": "$$.Execution.Input.job_id",
+                  "triggered_by": "finops_correlation"
+                }
+              },
+              "OutputPath": "$.Payload",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "ComplianceCorrelationFailed",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "End": true
+            },
+            "ComplianceCorrelationFailed": {
+              "Type": "Pass",
+              "Parameters": {
+                "agent": "compliance",
+                "status": "error",
+                "message": "Compliance correlation failed"
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "ResultPath": "$.correlation_agents",
+      "Next": "MergeCorrelationResults"
+    },
+    "MergeCorrelationResults": {
+      "Type": "Pass",
+      "Parameters": {
+        "job_id.$": "$.job_id",
+        "agent": "finops_with_correlation",
+        "query.$": "$.query",
+        "user_id.$": "$.user_id",
+        "agent_response": {
+          "finops_result.$": "$.agent_response",
+          "security_result.$": "$.correlation_agents[0]",
+          "compliance_result.$": "$.correlation_agents[1]",
+          "job_id.$": "$.job_id",
+          "agent": "finops_with_correlation"
+        }
+      },
+      "Next": "SaveCorrelationResultToDynamoDB"
+    },
+    "SaveCorrelationResultToDynamoDB": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "pfl-aegis-agent-jobs",
+        "Key": {
+          "job_id": {
+            "S.$": "$.job_id"
+          }
+        },
+        "UpdateExpression": "SET #s = :status, #r = :result, #ca = :completed_at, #t = :result_type",
+        "ExpressionAttributeNames": {
+          "#s": "status",
+          "#r": "result",
+          "#ca": "completed_at",
+          "#t": "result_type"
+        },
+        "ExpressionAttributeValues": {
+          ":status": {
+            "S": "completed"
+          },
+          ":result": {
+            "S.$": "States.JsonToString($.agent_response)"
+          },
+          ":completed_at": {
+            "S.$": "$$.State.EnteredTime"
+          },
+          ":result_type": {
+            "S": "finops_with_correlation"
+          }
+        }
+      },
+      "ResultPath": "$.dynamodb_result",
+      "End": true
+    },
+    "CallSecurityAgent": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:ap-south-1:644130540803:function:pfl-aegis-cloud-SecurityAgent-prod-aps1",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "agent_response.$": "$.Payload",
+        "job_id.$": "$$.Execution.Input.job_id",
+        "agent.$": "$$.Execution.Input.agent",
+        "query.$": "$$.Execution.Input.query",
+        "user_id.$": "$$.Execution.Input.user_id"
+      },
+      "ResultPath": "$",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "SaveErrorToDynamoDB",
+          "ResultPath": "$.error_info"
+        }
+      ],
+      "Next": "SaveResultToDynamoDB"
+    },
+    "CallComplianceAgent": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:ap-south-1:644130540803:function:pfl-aegis-cloud-ComplianceAgent-prod-aps1",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "agent_response.$": "$.Payload",
+        "job_id.$": "$$.Execution.Input.job_id",
+        "agent.$": "$$.Execution.Input.agent",
+        "query.$": "$$.Execution.Input.query",
+        "user_id.$": "$$.Execution.Input.user_id"
+      },
+      "ResultPath": "$",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "SaveErrorToDynamoDB",
+          "ResultPath": "$.error_info"
+        }
+      ],
+      "Next": "SaveResultToDynamoDB"
+    },
+    "CallAllAgentsParallel": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "FinOpsParallel",
+          "States": {
+            "FinOpsParallel": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "arn:aws:lambda:ap-south-1:644130540803:function:pfl-aegis-cloud-FinOpsAgent-prod-aps1",
+                "Payload.$": "$"
+              },
+              "OutputPath": "$.Payload",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException",
+                    "Lambda.SdkClientException"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "FinOpsParallelFailed",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "End": true
+            },
+            "FinOpsParallelFailed": {
+              "Type": "Pass",
+              "Parameters": {
+                "agent": "finops",
+                "status": "error",
+                "message": "FinOps agent failed"
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "SecurityParallel",
+          "States": {
+            "SecurityParallel": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "arn:aws:lambda:ap-south-1:644130540803:function:pfl-aegis-cloud-SecurityAgent-prod-aps1",
+                "Payload.$": "$"
+              },
+              "OutputPath": "$.Payload",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException",
+                    "Lambda.SdkClientException"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "SecurityParallelFailed",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "End": true
+            },
+            "SecurityParallelFailed": {
+              "Type": "Pass",
+              "Parameters": {
+                "agent": "security",
+                "status": "error",
+                "message": "Security agent failed"
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "ComplianceParallel",
+          "States": {
+            "ComplianceParallel": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "arn:aws:lambda:ap-south-1:644130540803:function:pfl-aegis-cloud-ComplianceAgent-prod-aps1",
+                "Payload.$": "$"
+              },
+              "OutputPath": "$.Payload",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException",
+                    "Lambda.SdkClientException"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "ComplianceParallelFailed",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "End": true
+            },
+            "ComplianceParallelFailed": {
+              "Type": "Pass",
+              "Parameters": {
+                "agent": "compliance",
+                "status": "error",
+                "message": "Compliance agent failed"
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "ResultSelector": {
+        "agent_response.$": "$",
+        "job_id.$": "$$.Execution.Input.job_id",
+        "agent.$": "$$.Execution.Input.agent",
+        "query.$": "$$.Execution.Input.query",
+        "user_id.$": "$$.Execution.Input.user_id"
+      },
+      "ResultPath": "$",
+      "Next": "SaveResultToDynamoDB"
+    },
+    "SaveResultToDynamoDB": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "pfl-aegis-agent-jobs",
+        "Key": {
+          "job_id": {
+            "S.$": "$.job_id"
+          }
+        },
+        "UpdateExpression": "SET #s = :status, #r = :result, #ca = :completed_at",
+        "ExpressionAttributeNames": {
+          "#s": "status",
+          "#r": "result",
+          "#ca": "completed_at"
+        },
+        "ExpressionAttributeValues": {
+          ":status": {
+            "S": "completed"
+          },
+          ":result": {
+            "S.$": "States.JsonToString($.agent_response)"
+          },
+          ":completed_at": {
+            "S.$": "$$.State.EnteredTime"
+          }
+        }
+      },
+      "ResultPath": "$.dynamodb_result",
+      "End": true
+    },
+    "SaveErrorToDynamoDB": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "pfl-aegis-agent-jobs",
+        "Key": {
+          "job_id": {
+            "S.$": "$$.Execution.Input.job_id"
+          }
+        },
+        "UpdateExpression": "SET #s = :status, #e = :error_msg, #ca = :completed_at",
+        "ExpressionAttributeNames": {
+          "#s": "status",
+          "#e": "error_message",
+          "#ca": "completed_at"
+        },
+        "ExpressionAttributeValues": {
+          ":status": {
+            "S": "error"
+          },
+          ":error_msg": {
+            "S": "Agent failed to respond. Please try again."
+          },
+          ":completed_at": {
+            "S.$": "$$.State.EnteredTime"
+          }
+        }
+      },
+      "ResultPath": "$.dynamodb_result",
+      "End": true
+    }
+  }
+}
